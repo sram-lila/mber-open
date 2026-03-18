@@ -175,6 +175,7 @@ class BaseTrajectoryModule(BaseModule):
                 num_recycles=self.model_config.num_recycles_design,
                 best_metric="loss",
             )
+            self.af_model._args["use_templates"] = self.model_config.use_templates
 
         if self.trajectory_config.update_esm_bias:
             with timer(
@@ -299,15 +300,19 @@ class BaseTrajectoryModule(BaseModule):
             design_state.template_data.get_fix_pos() - 1
         )
 
-        # Convert binder bias to sequence probabilities
-        seq_probs = np.exp(design_state.template_data.binder_bias) / np.sum(
-            np.exp(design_state.template_data.binder_bias), axis=1, keepdims=True
-        )
-
-        # Set initial sequence and bias
-        self.af_model.set_seq(
-            seq=seq_probs, bias=design_state.template_data.binder_bias
-        )
+        if design_state.trajectory_data.seed_seq:
+            self._log(f"Warm-starting from seed sequence: {design_state.trajectory_data.seed_seq[:30]}...")
+            self.af_model.set_seq(
+                seq=design_state.trajectory_data.seed_seq,
+                bias=design_state.template_data.binder_bias,
+            )
+        else:
+            seq_probs = np.exp(design_state.template_data.binder_bias) / np.sum(
+                np.exp(design_state.template_data.binder_bias), axis=1, keepdims=True
+            )
+            self.af_model.set_seq(
+                seq=seq_probs, bias=design_state.template_data.binder_bias
+            )
 
     @time_method()
     def _precompile_model(self, design_state: Optional[DesignState] = None) -> None:
@@ -344,15 +349,27 @@ class BaseTrajectoryModule(BaseModule):
         design_state.trajectory_data.early_stop = True
         design_state.trajectory_data.trajectory_complete = True
 
+    def _effective_iters(self, base_iters: int) -> int:
+        """Scale iteration count by warm_start_iters_multiplier."""
+        m = self.trajectory_config.warm_start_iters_multiplier
+        return int(base_iters * m) if m != 1.0 else base_iters
+
     @time_method()
     def _design_logits(self, design_state: DesignState) -> bool:
         """Run the design optimization phase to generate logits."""
+        soft_iters = self._effective_iters(self.trajectory_config.soft_iters)
+        temp_iters = self._effective_iters(self.trajectory_config.temp_iters)
+        hard_iters = self._effective_iters(self.trajectory_config.hard_iters)
+
+        if self.trajectory_config.warm_start_iters_multiplier != 1.0:
+            self._log(
+                f"Iters scaled by {self.trajectory_config.warm_start_iters_multiplier}x: "
+                f"soft={soft_iters}, temp={temp_iters}, hard={hard_iters}"
+            )
+
         # First part of design with early stopping check
         self.af_model.design(
-            iters=int(
-                self.trajectory_config.soft_iters
-                * self.trajectory_config.early_stop_fraction
-            ),
+            iters=int(soft_iters * self.trajectory_config.early_stop_fraction),
             soft=0,
             e_soft=self.trajectory_config.early_stop_fraction,
             models=self.model_config.design_models,
@@ -373,10 +390,7 @@ class BaseTrajectoryModule(BaseModule):
 
         # Continue with remaining soft iterations
         self.af_model.design(
-            iters=int(
-                self.trajectory_config.soft_iters
-                * (1 - self.trajectory_config.early_stop_fraction)
-            ),
+            iters=int(soft_iters * (1 - self.trajectory_config.early_stop_fraction)),
             soft=self.trajectory_config.early_stop_fraction,
             e_soft=1,
             models=self.model_config.design_models,
@@ -387,7 +401,7 @@ class BaseTrajectoryModule(BaseModule):
 
         # Temperature-based design phase
         self.af_model.design(
-            iters=self.trajectory_config.temp_iters,
+            iters=temp_iters,
             soft=1,
             temp=1,
             e_temp=1e-2,
@@ -398,9 +412,9 @@ class BaseTrajectoryModule(BaseModule):
         )
 
         # Hard design phase
-        if self.trajectory_config.hard_iters > 0:
+        if hard_iters > 0:
             self.af_model.design(
-                iters=self.trajectory_config.hard_iters,
+                iters=hard_iters,
                 soft=1,
                 hard=1,
                 temp=1e-2,

@@ -37,6 +37,7 @@ class BaseModelConfig:
     eval_models: List[int] = field(default_factory=lambda: [0])
     use_multimer_eval: bool = True
     num_recycles_eval: int = 3
+    use_templates: bool = True
 
 
 @dataclass
@@ -78,6 +79,7 @@ class BaseTrajectoryConfig:
     early_stopping: bool = True
     early_stop_iptm: float = 0.8
     early_stop_fraction: float = 0.6
+    warm_start_iters_multiplier: float = 1.0
 
     plm_model: str = "esm2-650M"
     

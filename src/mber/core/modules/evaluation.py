@@ -123,6 +123,7 @@ class BaseEvaluationModule(BaseModule):
                 use_multimer=self.model_config.use_multimer_eval,
                 num_recycles=self.model_config.num_recycles_eval,
             )
+            self.af_complex_model._args["use_templates"] = self.model_config.use_templates
 
         with timer(
             "Initialize ESM model", self._log, design_state.evaluation_data.timings

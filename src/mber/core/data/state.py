@@ -146,6 +146,7 @@ class TrajectoryData(SerializableDataclass):
     # inputs
     seed: int = None
     trajectory_name: str = None
+    seed_seq: Optional[str] = None  # warm-start: initialize optimization from this sequence
 
     # outputs
     metrics: List[dict] = None

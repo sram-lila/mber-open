@@ -4,7 +4,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import yaml  # type: ignore
@@ -147,6 +147,138 @@ def _append_csv(
         ])
 
 
+DEFAULT_WARM_START_ITERS_MULTIPLIER = 2.0
+
+
+def _resolve_path(path: str) -> str:
+    """Download S3 paths to a local temp file; return local paths unchanged."""
+    if not path.startswith("s3://"):
+        return path
+    import subprocess
+    import tempfile
+    suffix = Path(path).suffix or ".csv"
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    tmp.close()
+    print(f"[warm-start] Downloading {path} → {tmp.name}")
+    subprocess.check_call(["aws", "s3", "cp", path, tmp.name], stdout=subprocess.DEVNULL)
+    return tmp.name
+
+
+def _load_seed_sequences_from_csv(
+    csv_path: str,
+    min_iptm: float,
+    min_plddt: float,
+) -> List[Tuple[str, float, float]]:
+    """Parse a CSV (accepted.csv or all_trajectories.csv) for seed sequences.
+
+    Expects columns ``binder_seq``, ``i_ptm``, and optionally ``plddt``.
+    """
+    candidates: List[Tuple[str, float, float]] = []
+    seen_seqs: set = set()
+
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            seq = (row.get("binder_seq") or "").strip()
+            raw_iptm = row.get("i_ptm", "")
+            raw_plddt = row.get("plddt", "")
+            if not seq or not raw_iptm:
+                continue
+            try:
+                iptm = float(raw_iptm)
+            except (ValueError, TypeError):
+                continue
+            try:
+                plddt = float(raw_plddt) if raw_plddt else 0.0
+            except (ValueError, TypeError):
+                plddt = 0.0
+            if seq in seen_seqs:
+                continue
+            seen_seqs.add(seq)
+            candidates.append((seq, iptm, plddt))
+
+    return candidates
+
+
+def _load_seed_sequences_from_dir(
+    run_dir: str,
+) -> List[Tuple[str, float, float]]:
+    """Scan ``runs/*/evaluation_data/evaluation_data.json`` for binder entries."""
+    runs_dir = os.path.join(run_dir, "runs")
+    if not os.path.isdir(runs_dir):
+        print(f"[warm-start] No runs/ directory in {run_dir}", file=sys.stderr)
+        return []
+
+    candidates: List[Tuple[str, float, float]] = []
+    seen_seqs: set = set()
+
+    for traj_dir in sorted(Path(runs_dir).iterdir()):
+        eval_json = traj_dir / "evaluation_data" / "evaluation_data.json"
+        if not eval_json.exists():
+            continue
+        try:
+            data = json.loads(eval_json.read_text())
+            binders = data.get("binders", []) if isinstance(data, dict) else data
+            if not isinstance(binders, list):
+                binders = [binders]
+            for b in binders:
+                seq = b.get("binder_seq")
+                iptm = b.get("i_ptm")
+                plddt = b.get("plddt")
+                if not seq or iptm is None:
+                    continue
+                if seq in seen_seqs:
+                    continue
+                seen_seqs.add(seq)
+                candidates.append((seq, float(iptm), float(plddt or 0.0)))
+        except Exception as exc:
+            print(f"[warm-start] Skipping {eval_json}: {exc}", file=sys.stderr)
+
+    return candidates
+
+
+def _load_seed_sequences(
+    warm_start_source: str,
+    min_iptm: float = 0.0,
+    min_plddt: float = 0.0,
+) -> List[Tuple[str, float, float]]:
+    """Load evaluated binder sequences from a previous run.
+
+    ``warm_start_source`` can be:
+      - A CSV file path (local or ``s3://``) with ``binder_seq`` / ``i_ptm`` columns
+      - A local output directory containing ``runs/*/evaluation_data/``
+
+    Returns ``(sequence, iPTM, pLDDT)`` tuples sorted by iPTM descending,
+    filtered to semi-successful candidates (below acceptance thresholds).
+    """
+    local_path = _resolve_path(warm_start_source)
+
+    if local_path.endswith(".csv"):
+        candidates = _load_seed_sequences_from_csv(local_path, min_iptm, min_plddt)
+    elif os.path.isdir(local_path):
+        candidates = _load_seed_sequences_from_dir(local_path)
+    else:
+        print(f"[warm-start] {warm_start_source} is not a CSV or directory", file=sys.stderr)
+        return []
+
+    # Sort by iPTM descending (best candidates first)
+    candidates.sort(key=lambda t: t[1], reverse=True)
+
+    # Filter: keep sequences that didn't pass BOTH acceptance thresholds
+    semi = [c for c in candidates if c[1] < min_iptm or c[2] < min_plddt]
+    if not semi:
+        semi = candidates
+
+    if semi:
+        print(
+            f"[warm-start] Loaded {len(semi)} seed sequences from {warm_start_source} "
+            f"(iPTM range {semi[-1][1]:.4f} – {semi[0][1]:.4f})"
+        )
+    else:
+        print(f"[warm-start] No seed sequences found in {warm_start_source}")
+    return semi
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         "mber-vhh",
@@ -170,6 +302,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--max-trajectories", type=int, default=DEFAULT_MAX_TRAJ, help=f"Max trajectories to attempt (default {DEFAULT_MAX_TRAJ})")
     p.add_argument("--min-iptm", type=float, default=DEFAULT_MIN_IPTM, help=f"Minimum iPTM to accept (default {DEFAULT_MIN_IPTM})")
     p.add_argument("--min-plddt", type=float, default=DEFAULT_MIN_PLDDT, help=f"Minimum pLDDT to accept (default {DEFAULT_MIN_PLDDT})")
+    p.add_argument("--warm-start", metavar="PATH", default=None,
+                   help="CSV file (local or s3://) or output directory from a previous run; loads semi-successful sequences as starting points")
+    p.add_argument("--warm-start-iters-multiplier", type=float, default=DEFAULT_WARM_START_ITERS_MULTIPLIER,
+                   help=f"Multiply trajectory iterations when warm-starting (default {DEFAULT_WARM_START_ITERS_MULTIPLIER})")
+    p.add_argument("--no-templates", action="store_true", help="Disable AlphaFold template features during design and evaluation")
     p.add_argument("--no-animations", action="store_true", help="Skip saving animated trajectory HTML files to save space")
     p.add_argument("--no-pickle", action="store_true", help="Skip saving design_state.pickle files to save space")
     p.add_argument("--no-png", action="store_true", help="Skip saving PNG plots (e.g., pssm_logits.png) to save space")
@@ -205,6 +342,7 @@ def _collect_interactive() -> Dict[str, Any]:
     min_iptm = _prompt(f"Minimum iPTM threshold (default {DEFAULT_MIN_IPTM})", str(DEFAULT_MIN_IPTM))
     min_plddt = _prompt(f"Minimum pLDDT threshold (default {DEFAULT_MIN_PLDDT})", str(DEFAULT_MIN_PLDDT))
     
+    no_templates = _prompt("Disable AlphaFold templates? (y/N)", "N").lower() in ("y", "yes")
     skip_animations = _prompt("Skip saving animations? (y/N)", "N").lower() in ("y", "yes")
     skip_pickle = _prompt("Skip saving pickle files? (y/N)", "N").lower() in ("y", "yes")
     skip_png = _prompt("Skip saving PNG plots? (y/N)", "N").lower() in ("y", "yes")
@@ -212,6 +350,7 @@ def _collect_interactive() -> Dict[str, Any]:
     cfg: Dict[str, Any] = {
         "output": {"dir": output_dir, "skip_animations": skip_animations, "skip_pickle": skip_pickle, "skip_png": skip_png},
         "target": {"pdb": input_pdb, "name": target_name or None, "chains": chains, "hotspots": hotspots or None},
+        "model": {"use_templates": not no_templates},
         "stopping": {"num_accepted": int(num_accepted), "max_trajectories": int(max_traj)},
         "filters": {"min_iptm": float(min_iptm), "min_plddt": float(min_plddt)},
     }
@@ -236,6 +375,13 @@ def _merge_flags_into_cfg(args: argparse.Namespace) -> Optional[Dict[str, Any]]:
             "chains": args.chains,
             "hotspots": args.hotspots,
         },
+        "model": {
+            "use_templates": not args.no_templates,
+        },
+        "warm_start": {
+            "dir": args.warm_start,
+            "iters_multiplier": args.warm_start_iters_multiplier,
+        },
         "stopping": {
             "num_accepted": int(args.num_accepted),
             "max_trajectories": int(args.max_trajectories),
@@ -258,6 +404,8 @@ def _build_state_from_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     out_dir = out_cfg["dir"]
     tgt = cfg["target"]
     binder = cfg.get("binder", {}) or {}
+    model_cfg = cfg.get("model", {}) or {}
+    warm_start_cfg = cfg.get("warm_start", {}) or {}
     stopping = cfg.get("stopping", {})
     filters = cfg.get("filters", {})
 
@@ -292,6 +440,11 @@ def _build_state_from_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "max_trajectories": max_trajectories,
         "min_iptm": min_iptm,
         "min_plddt": min_plddt,
+        "use_templates": model_cfg.get("use_templates", True),
+        "warm_start_dir": warm_start_cfg.get("dir"),
+        "warm_start_iters_multiplier": float(
+            warm_start_cfg.get("iters_multiplier", DEFAULT_WARM_START_ITERS_MULTIPLIER)
+        ),
         "skip_animations": out_cfg.get("skip_animations", False),
         "skip_pickle": out_cfg.get("skip_pickle", False),
         "skip_png": out_cfg.get("skip_png", False),
@@ -299,11 +452,15 @@ def _build_state_from_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _run_one_trajectory(state: DesignState) -> DesignState:
+def _run_one_trajectory(
+    state: DesignState,
+    use_templates: bool = True,
+    warm_start_iters_multiplier: float = 1.0,
+) -> DesignState:
     template_cfg = TemplateConfig()
-    model_cfg = ModelConfig()
+    model_cfg = ModelConfig(use_templates=use_templates)
     loss_cfg = LossConfig()
-    traj_cfg = TrajectoryConfig()
+    traj_cfg = TrajectoryConfig(warm_start_iters_multiplier=warm_start_iters_multiplier)
     env_cfg = EnvironmentConfig()
     eval_cfg = EvaluationConfig()
 
@@ -390,10 +547,22 @@ def main() -> None:
     max_trajectories = built["max_trajectories"]
     min_iptm = built["min_iptm"]
     min_plddt = built["min_plddt"]
+    use_templates = built["use_templates"]
+    warm_start_dir = built["warm_start_dir"]
+    warm_start_iters_multiplier = built["warm_start_iters_multiplier"]
     state: DesignState = built["state"]
     skip_animations = built["skip_animations"]
     skip_pickle = built["skip_pickle"]
     skip_png = built["skip_png"]
+
+    # Load seed sequences from a previous run if warm-starting
+    seed_sequences: List[str] = []
+    if warm_start_dir:
+        seed_entries = _load_seed_sequences(warm_start_dir, min_iptm=min_iptm, min_plddt=min_plddt)
+        seed_sequences = [entry[0] for entry in seed_entries]
+        if not seed_sequences:
+            print("[warm-start] WARNING: no seed sequences found, falling back to normal design")
+            warm_start_iters_multiplier = 1.0
 
     _ensure_dir(output_dir)
     accepted_csv = os.path.join(output_dir, "accepted.csv")
@@ -410,11 +579,16 @@ def main() -> None:
         print(f"Target of {num_accepted} accepted designs already reached. Exiting.")
         return
 
+    ws_info = ""
+    if seed_sequences:
+        ws_info = f", warm_start={len(seed_sequences)} seeds, iters_multiplier={warm_start_iters_multiplier}"
+
     print(
         f"Running VHH design: output={output_dir}, chains={state.template_data.region}, hotspots={state.template_data.target_hotspot_residues or 'None'}, "
         f"target_accepted={num_accepted}, existing={existing_accepted}, remaining={remaining_needed}, "
         f"max_trajectories={max_trajectories} (default {DEFAULT_MAX_TRAJ}), "
-        f"min_iptm={min_iptm} (default {DEFAULT_MIN_IPTM}), min_plddt={min_plddt} (default {DEFAULT_MIN_PLDDT})"
+        f"min_iptm={min_iptm} (default {DEFAULT_MIN_IPTM}), min_plddt={min_plddt} (default {DEFAULT_MIN_PLDDT}), "
+        f"use_templates={use_templates}{ws_info}"
     )
 
     accepted_count = 0
@@ -422,7 +596,21 @@ def main() -> None:
 
     while accepted_count < remaining_needed and traj_count < max_trajectories:
         traj_count += 1
-        run_state = _run_one_trajectory(state)
+
+        # When warm-starting, cycle through seed sequences then fall back to normal
+        if seed_sequences:
+            idx = (traj_count - 1) % len(seed_sequences)
+            state.trajectory_data.seed_seq = seed_sequences[idx]
+            iters_mult = warm_start_iters_multiplier
+        else:
+            state.trajectory_data.seed_seq = None
+            iters_mult = 1.0
+
+        run_state = _run_one_trajectory(
+            state,
+            use_templates=use_templates,
+            warm_start_iters_multiplier=iters_mult,
+        )
 
         run_dir = _save_run_state(
             output_dir,
