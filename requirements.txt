@@ -4,8 +4,8 @@ torchvision
 torchaudio
 transformers
 
-# colabdesign (as of 2025-08-06)
-colabdesign @ git+https://github.com/sokrypton/ColabDesign.git@d024c4e
+# colabdesign — pre-installed from git in the ImageSpec commands
+colabdesign
 
 # jax requirements
 jax[cuda12]==0.5.2
