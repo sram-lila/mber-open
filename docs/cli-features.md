@@ -96,6 +96,55 @@ The Flyte task downloads the CSV from S3 using `FlyteFile` before passing it to 
 
 ---
 
+## CDR3 Length Sampling
+
+Sample CDR3 lengths from empirical VHH distributions (137 short + 113 long NCBI sequences). The script lives in the `cd52_binder_design` repo at `karl_pls/sample_cdr3_length.py`.
+
+### Usage
+
+```bash
+# Sample one CDR3 length for a short framework
+python karl_pls/sample_cdr3_length.py short
+# 10
+
+# Sample one CDR3 length for a long framework
+python karl_pls/sample_cdr3_length.py long
+# 19
+
+# Sample 20 lengths at once
+python karl_pls/sample_cdr3_length.py short --n 20
+
+# Print the full distribution
+python karl_pls/sample_cdr3_length.py short --stats
+python karl_pls/sample_cdr3_length.py long --stats
+
+# Reproducible sampling
+python karl_pls/sample_cdr3_length.py short --seed 42
+```
+
+### Which distribution to use
+
+- **Short** frameworks (F-ER-G-short-2, Y-QR-L-short-2, Y-ER-L-short-2): `python sample_cdr3_length.py short`
+- **Long** frameworks (F-ER-F-long-2+93A, F-ER-G-long-2+93A, V-GL-W-long-2+93A+W103R): `python sample_cdr3_length.py long`
+
+For long frameworks, the first CDR3 residue (position 93) **must** be Alanine. Use `A` + `(length-1)` `*` characters in the masked sequence.
+
+### Building a masked sequence
+
+Replace `<CDR3>` in the framework's aligned sequence with sampled-length `*` characters:
+
+```bash
+# Short framework, CDR3 length 10 → 10 stars
+...TAVYYC**********WGQGTLVTVSS
+
+# Long framework, CDR3 length 19 → A + 18 stars
+...TAVYYCA******************WGQGTLVTVSS
+```
+
+Framework sequences are in `karl_pls/karl_revised_vhh_frameworks.json`.
+
+---
+
 ## Full CLI Reference
 
 ```
